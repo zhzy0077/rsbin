@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tempfile::NamedTempFile;
 
 #[derive(Parser, Debug)]
@@ -40,8 +40,42 @@ enum Commands {
 #[derive(Debug, Deserialize)]
 struct Config {
     #[serde(rename = "def")]
-    definitions: HashMap<String, Vec<HashMap<String, String>>>,
+    definitions: Definitions,
     packages: Vec<Package>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Definitions {
+    #[serde(flatten)]
+    by_os: HashMap<String, Vec<DefinitionSet>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DefinitionSet {
+    #[serde(flatten)]
+    values: HashMap<String, DefinitionValueList>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DefinitionValueList(Vec<String>);
+
+impl<'de> Deserialize<'de> for DefinitionValueList {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawDefinitionValue {
+            Scalar(String),
+            List(Vec<String>),
+        }
+
+        match RawDefinitionValue::deserialize(deserializer)? {
+            RawDefinitionValue::Scalar(value) => Ok(Self(vec![value])),
+            RawDefinitionValue::List(values) => Ok(Self(values)),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,6 +409,7 @@ fn render_package_candidates(package: &Package, config: &Config) -> Result<Vec<R
     let os = current_os_key()?;
     let definitions = config
         .definitions
+        .by_os
         .get(os)
         .ok_or_else(|| anyhow!("missing def entry for current OS: {os}"))?;
     let arches = current_arch_aliases()?;
@@ -383,32 +418,53 @@ fn render_package_candidates(package: &Package, config: &Config) -> Result<Vec<R
 
     for arch in arches {
         for definition in definitions {
-            let mut vars = BTreeMap::new();
-            vars.insert("os".to_string(), os.to_string());
-            vars.insert("arch".to_string(), arch.to_string());
+            let mut base_vars = BTreeMap::new();
+            base_vars.insert("os".to_string(), os.to_string());
+            base_vars.insert("arch".to_string(), arch.to_string());
 
-            for (key, value) in definition {
-                vars.insert(key.clone(), expand_template(value, &vars)?);
-            }
-
-            let rendered = RenderedPackage {
-                artifact: expand_template(&package.artifact, &vars)?,
-                files: package
-                    .file
-                    .iter()
-                    .map(|file| {
-                        Ok(RenderedFile {
-                            name: expand_template(&file.name, &vars)?,
-                            path: PathBuf::from(expand_template(&file.path, &vars)?),
+            for vars in expand_definition_set(definition, base_vars)? {
+                let rendered = RenderedPackage {
+                    artifact: expand_template(&package.artifact, &vars)?,
+                    files: package
+                        .file
+                        .iter()
+                        .map(|file| {
+                            Ok(RenderedFile {
+                                name: expand_template(&file.name, &vars)?,
+                                path: PathBuf::from(expand_template(&file.path, &vars)?),
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            };
+                        .collect::<Result<Vec<_>>>()?,
+                };
 
-            if seen.insert(rendered.artifact.clone()) {
-                candidates.push(rendered);
+                if seen.insert(rendered.artifact.clone()) {
+                    candidates.push(rendered);
+                }
             }
         }
+    }
+
+    Ok(candidates)
+}
+
+fn expand_definition_set(
+    definition: &DefinitionSet,
+    base_vars: BTreeMap<String, String>,
+) -> Result<Vec<BTreeMap<String, String>>> {
+    let mut candidates = vec![base_vars];
+
+    for (key, values) in &definition.values {
+        let mut next_candidates = Vec::new();
+
+        for vars in &candidates {
+            for value in &values.0 {
+                let mut next_vars = vars.clone();
+                next_vars.insert(key.clone(), expand_template(value, vars)?);
+                next_candidates.push(next_vars);
+            }
+        }
+
+        candidates = next_candidates;
     }
 
     Ok(candidates)
@@ -693,7 +749,128 @@ packages:
     fn parses_sample_config() {
         let config = sample_config();
         assert_eq!(config.packages[0].name, "uv");
-        assert_eq!(config.definitions["linux"].len(), 1);
+        assert_eq!(config.definitions.by_os["linux"].len(), 1);
+        assert_eq!(
+            config.definitions.by_os["linux"][0].values["rust-triple"],
+            DefinitionValueList(vec!["{arch}-unknown-linux-gnu".to_string()])
+        );
+    }
+
+    #[test]
+    fn parses_ordered_definition_values() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+def:
+  linux:
+    - rust-triple:
+        - "{arch}-unknown-linux-gnu"
+        - "{arch}-unknown-linux-musl"
+
+packages:
+  - name: worktrunk
+    repo: https://github.com/max-sixty/worktrunk
+    artifact: worktrunk-{rust-triple}.tar.xz
+    file:
+      - name: wt
+        path: worktrunk-{rust-triple}/wt
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.definitions.by_os["linux"][0].values["rust-triple"],
+            DefinitionValueList(vec![
+                "{arch}-unknown-linux-gnu".to_string(),
+                "{arch}-unknown-linux-musl".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn renders_ordered_definition_fallback_candidates() {
+        let mut values = HashMap::new();
+        values.insert(
+            "rust-triple".to_string(),
+            DefinitionValueList(vec![
+                "{arch}-unknown-linux-gnu".to_string(),
+                "{arch}-unknown-linux-musl".to_string(),
+            ]),
+        );
+        let mut by_os = HashMap::new();
+        by_os.insert(
+            current_os_key().unwrap().to_string(),
+            vec![DefinitionSet { values }],
+        );
+        let config = Config {
+            definitions: Definitions { by_os },
+            packages: Vec::new(),
+        };
+        let package = Package {
+            name: "tool".to_string(),
+            repo: "https://github.com/example/tool".to_string(),
+            artifact: "tool-{rust-triple}.tar.xz".to_string(),
+            file: vec![FileEntry {
+                name: "tool".to_string(),
+                path: "tool-{rust-triple}/tool".to_string(),
+            }],
+        };
+
+        let arch = current_arch_aliases().unwrap()[0];
+        let candidates = render_package_candidates(&package, &config).unwrap();
+
+        assert_eq!(
+            candidates[0].artifact,
+            format!("tool-{arch}-unknown-linux-gnu.tar.xz")
+        );
+        assert_eq!(
+            candidates[1].artifact,
+            format!("tool-{arch}-unknown-linux-musl.tar.xz")
+        );
+    }
+
+    #[test]
+    fn matches_later_definition_fallback_asset() {
+        let mut values = HashMap::new();
+        values.insert(
+            "rust-triple".to_string(),
+            DefinitionValueList(vec![
+                "{arch}-unknown-linux-gnu".to_string(),
+                "{arch}-unknown-linux-musl".to_string(),
+            ]),
+        );
+        let mut by_os = HashMap::new();
+        by_os.insert(
+            current_os_key().unwrap().to_string(),
+            vec![DefinitionSet { values }],
+        );
+        let config = Config {
+            definitions: Definitions { by_os },
+            packages: Vec::new(),
+        };
+        let package = Package {
+            name: "tool".to_string(),
+            repo: "https://github.com/example/tool".to_string(),
+            artifact: "tool-{rust-triple}.tar.xz".to_string(),
+            file: vec![FileEntry {
+                name: "tool".to_string(),
+                path: "tool-{rust-triple}/tool".to_string(),
+            }],
+        };
+        let arch = current_arch_aliases().unwrap()[0];
+        let release = GitHubRelease {
+            tag_name: "v1.0.0".to_string(),
+            assets: vec![GitHubAsset {
+                name: format!("tool-{arch}-unknown-linux-musl.tar.xz"),
+                browser_download_url: "https://example.com/tool.tar.xz".to_string(),
+            }],
+        };
+
+        let matched = match_asset(&package, &config, &release).unwrap();
+
+        assert_eq!(
+            matched.rendered.artifact,
+            format!("tool-{arch}-unknown-linux-musl.tar.xz")
+        );
     }
 
     #[test]
