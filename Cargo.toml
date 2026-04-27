@@ -1,6 +1,6 @@
 [package]
 name = "rsbin"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
@@ -15,4 +15,5 @@ serde_yaml = "0.9.34"
 tar = "0.4.44"
 tempfile = "3.19.1"
 tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
+xz2 = "0.1.7"
 zstd = "0.13.3"

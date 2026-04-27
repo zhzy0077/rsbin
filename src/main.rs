@@ -519,7 +519,11 @@ fn extract_artifact(
     temp_dir: &Path,
 ) -> Result<Vec<ExtractedFile>> {
     if rendered.artifact.ends_with(".tar.gz") || rendered.artifact.ends_with(".tgz") {
-        extract_tar_gz(rendered, bytes, temp_dir)
+        let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+        extract_tar(rendered, decoder, temp_dir)
+    } else if rendered.artifact.ends_with(".tar.xz") || rendered.artifact.ends_with(".txz") {
+        let decoder = xz2::read::XzDecoder::new(Cursor::new(bytes));
+        extract_tar(rendered, decoder, temp_dir)
     } else if rendered.artifact.ends_with(".zst") {
         extract_single_zst(rendered, bytes, temp_dir)
     } else {
@@ -527,9 +531,9 @@ fn extract_artifact(
     }
 }
 
-fn extract_tar_gz(
+fn extract_tar<R: io::Read>(
     rendered: &RenderedPackage,
-    bytes: &[u8],
+    reader: R,
     temp_dir: &Path,
 ) -> Result<Vec<ExtractedFile>> {
     let wanted: BTreeMap<PathBuf, String> = rendered
@@ -538,8 +542,7 @@ fn extract_tar_gz(
         .map(|file| (file.path.clone(), file.name.clone()))
         .collect();
     let mut extracted = Vec::new();
-    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
-    let mut archive = tar::Archive::new(decoder);
+    let mut archive = tar::Archive::new(reader);
 
     for entry in archive.entries().context("read tar entries")? {
         let mut entry = entry.context("read tar entry")?;
@@ -809,6 +812,46 @@ packages:
         assert_eq!(extracted.len(), 2);
         assert_eq!(fs::read(temp.path().join("uv")).unwrap(), b"uv-bin");
         assert_eq!(fs::read(temp.path().join("uvx")).unwrap(), b"uvx-bin");
+    }
+
+    #[test]
+    fn extracts_tar_xz_files() {
+        let mut tar_bytes = Vec::new();
+        {
+            let encoder = xz2::write::XzEncoder::new(&mut tar_bytes, 6);
+            let mut tar = Builder::new(encoder);
+            append_file(
+                &mut tar,
+                "worktrunk-aarch64-unknown-linux-musl/wt",
+                b"wt-bin",
+            );
+            append_file(
+                &mut tar,
+                "worktrunk-aarch64-unknown-linux-musl/git-wt",
+                b"git-wt-bin",
+            );
+            tar.finish().unwrap();
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let rendered = RenderedPackage {
+            artifact: "worktrunk.tar.xz".to_string(),
+            files: vec![
+                RenderedFile {
+                    name: "wt".to_string(),
+                    path: PathBuf::from("worktrunk-aarch64-unknown-linux-musl/wt"),
+                },
+                RenderedFile {
+                    name: "git-wt".to_string(),
+                    path: PathBuf::from("worktrunk-aarch64-unknown-linux-musl/git-wt"),
+                },
+            ],
+        };
+
+        let extracted = extract_artifact(&rendered, &tar_bytes, temp.path()).unwrap();
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(fs::read(temp.path().join("wt")).unwrap(), b"wt-bin");
+        assert_eq!(fs::read(temp.path().join("git-wt")).unwrap(), b"git-wt-bin");
     }
 
     #[test]
