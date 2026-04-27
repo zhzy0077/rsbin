@@ -154,6 +154,9 @@ async fn update(
         }
 
         if dry {
+            validate_package_archive(&client, &matched)
+                .await
+                .with_context(|| format!("validate archive for {}", package.name))?;
             continue;
         }
 
@@ -468,17 +471,7 @@ async fn install_package(
     matched: &MatchedAsset,
     install_dir: &Path,
 ) -> Result<()> {
-    let bytes = client
-        .get(&matched.download_url)
-        .send()
-        .await
-        .context("send asset download request")?
-        .error_for_status()
-        .context("asset download request failed")?
-        .bytes()
-        .await
-        .context("read asset bytes")?;
-
+    let bytes = download_asset(client, &matched.download_url).await?;
     let temp_dir = tempfile::tempdir().context("create extraction temp dir")?;
     let extracted = extract_artifact(&matched.rendered, &bytes, temp_dir.path())
         .with_context(|| format!("extract {}", matched.rendered.artifact))?;
@@ -491,6 +484,27 @@ async fn install_package(
     }
 
     Ok(())
+}
+
+async fn validate_package_archive(client: &reqwest::Client, matched: &MatchedAsset) -> Result<()> {
+    let bytes = download_asset(client, &matched.download_url).await?;
+    let temp_dir = tempfile::tempdir().context("create validation temp dir")?;
+    extract_artifact(&matched.rendered, &bytes, temp_dir.path())
+        .with_context(|| format!("validate {}", matched.rendered.artifact))?;
+    Ok(())
+}
+
+async fn download_asset(client: &reqwest::Client, download_url: &str) -> Result<bytes::Bytes> {
+    client
+        .get(download_url)
+        .send()
+        .await
+        .context("send asset download request")?
+        .error_for_status()
+        .context("asset download request failed")?
+        .bytes()
+        .await
+        .context("read asset bytes")
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -795,6 +809,40 @@ packages:
         assert_eq!(extracted.len(), 2);
         assert_eq!(fs::read(temp.path().join("uv")).unwrap(), b"uv-bin");
         assert_eq!(fs::read(temp.path().join("uvx")).unwrap(), b"uvx-bin");
+    }
+
+    #[test]
+    fn tar_gz_validation_fails_when_configured_paths_are_missing() {
+        let mut tar_bytes = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut tar_bytes, Compression::default());
+            let mut tar = Builder::new(encoder);
+            append_file(&mut tar, "uv-aarch64-unknown-linux-gnu/uv", b"uv-bin");
+            append_file(&mut tar, "uv-aarch64-unknown-linux-gnu/uvx", b"uvx-bin");
+            tar.finish().unwrap();
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let rendered = RenderedPackage {
+            artifact: "uv.tar.gz".to_string(),
+            files: vec![
+                RenderedFile {
+                    name: "uv".to_string(),
+                    path: PathBuf::from("uv"),
+                },
+                RenderedFile {
+                    name: "uvx".to_string(),
+                    path: PathBuf::from("uvx"),
+                },
+            ],
+        };
+
+        let error = extract_artifact(&rendered, &tar_bytes, temp.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("artifact missing configured file(s): uv, uvx")
+        );
     }
 
     #[test]
