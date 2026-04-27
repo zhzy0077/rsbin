@@ -1,0 +1,17 @@
+[package]
+name = "rsbin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.37", features = ["derive"] }
+dirs = "6.0.0"
+flate2 = "1.1.1"
+reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_yaml = "0.9.34"
+tar = "0.4.44"
+tempfile = "3.19.1"
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
+zstd = "0.13.3"
