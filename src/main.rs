@@ -515,7 +515,7 @@ fn current_os_key() -> Result<&'static str> {
 fn current_arch_aliases() -> Result<Vec<&'static str>> {
     match std::env::consts::ARCH {
         "aarch64" => Ok(vec!["arm64", "aarch64"]),
-        "x86_64" => Ok(vec!["x86_64", "amd64"]),
+        "x86_64" => Ok(vec!["x64", "x86_64", "amd64"]),
         "arm" => Ok(vec!["arm"]),
         other => bail!("unsupported arch: {other}"),
     }
