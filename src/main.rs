@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 #[derive(Parser, Debug)]
@@ -23,6 +23,10 @@ enum Commands {
         /// Resolve remote releases and planned installs without writing files.
         #[arg(long)]
         dry: bool,
+
+        /// Reinstall even when the lock file says a package is current.
+        #[arg(long)]
+        force: bool,
 
         /// Path to the YAML config file.
         #[arg(long)]
@@ -92,13 +96,19 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Update {
             dry,
+            force,
             config,
             packages,
-        } => update(config, packages, dry).await,
+        } => update(config, packages, dry, force).await,
     }
 }
 
-async fn update(config_path: Option<PathBuf>, package_names: Vec<String>, dry: bool) -> Result<()> {
+async fn update(
+    config_path: Option<PathBuf>,
+    package_names: Vec<String>,
+    dry: bool,
+    force: bool,
+) -> Result<()> {
     let config_path = config_path.unwrap_or(default_config_path()?);
     let config = load_config(&config_path)?;
     validate_config(&config)?;
@@ -107,18 +117,34 @@ async fn update(config_path: Option<PathBuf>, package_names: Vec<String>, dry: b
     let packages = select_packages(&config, requested.as_ref())?;
     let client = github_client()?;
     let install_dir = default_install_dir()?;
+    let lock_path = default_lock_path()?;
+    let mut lock = load_lock_file(&lock_path)?;
+    let mut lock_changed = false;
 
     for package in packages {
         let release = fetch_latest_release(&client, &package.repo)
             .await
             .with_context(|| format!("fetch latest release for {}", package.name))?;
+
+        if is_locked_latest(&lock, &package.name, &release.tag_name, force) {
+            println!("{} {} is already latest", package.name, release.tag_name);
+            continue;
+        }
+
         let matched = match_asset(package, &config, &release)
             .with_context(|| format!("match release asset for {}", package.name))?;
 
-        println!(
-            "{} {} -> {}",
-            package.name, matched.tag_name, matched.rendered.artifact
-        );
+        if dry {
+            println!(
+                "{} {} would update -> {}",
+                package.name, matched.tag_name, matched.rendered.artifact
+            );
+        } else {
+            println!(
+                "{} {} -> {}",
+                package.name, matched.tag_name, matched.rendered.artifact
+            );
+        }
         for file in &matched.rendered.files {
             println!(
                 "  {} -> {}",
@@ -134,6 +160,17 @@ async fn update(config_path: Option<PathBuf>, package_names: Vec<String>, dry: b
         install_package(&client, package, &matched, &install_dir)
             .await
             .with_context(|| format!("install {}", package.name))?;
+        if lock
+            .packages
+            .insert(package.name.clone(), matched.tag_name.clone())
+            != Some(matched.tag_name)
+        {
+            lock_changed = true;
+        }
+    }
+
+    if lock_changed {
+        save_lock_file(&lock_path, &lock)?;
     }
 
     Ok(())
@@ -164,6 +201,46 @@ fn validate_config(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct LockFile {
+    #[serde(default)]
+    packages: BTreeMap<String, String>,
+}
+
+fn load_lock_file(path: &Path) -> Result<LockFile> {
+    match fs::read_to_string(path) {
+        Ok(input) => {
+            serde_yaml::from_str(&input).with_context(|| format!("parse lock {}", path.display()))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(LockFile::default()),
+        Err(error) => Err(error).with_context(|| format!("read lock {}", path.display())),
+    }
+}
+
+fn save_lock_file(path: &Path, lock: &LockFile) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("lock path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+
+    let mut temp = NamedTempFile::new_in(parent).context("create lock temp file")?;
+    serde_yaml::to_writer(temp.as_file_mut(), lock)
+        .with_context(|| format!("write lock temp file for {}", path.display()))?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace {}", path.display()))?;
+
+    Ok(())
+}
+
+fn is_locked_latest(lock: &LockFile, package_name: &str, latest_tag: &str, force: bool) -> bool {
+    !force
+        && lock
+            .packages
+            .get(package_name)
+            .is_some_and(|version| version == latest_tag)
 }
 
 fn requested_packages(package_names: &[String]) -> Option<BTreeSet<&str>> {
@@ -554,6 +631,12 @@ fn default_config_path() -> Result<PathBuf> {
     Ok(config_dir.join("rsbin").join("config.yml"))
 }
 
+fn default_lock_path() -> Result<PathBuf> {
+    let config_dir =
+        dirs::config_dir().ok_or_else(|| anyhow!("could not determine user config directory"))?;
+    Ok(config_dir.join("rsbin").join("rsbin.lock.yml"))
+}
+
 fn default_install_dir() -> Result<PathBuf> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow!("could not determine user home directory"))?;
@@ -625,6 +708,42 @@ packages:
             ("astral-sh".to_string(), "uv".to_string())
         );
         assert!(parse_github_repo("https://example.com/openai/codex").is_err());
+    }
+
+    #[test]
+    fn missing_lock_file_loads_as_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock = load_lock_file(&temp.path().join("missing.lock.yml")).unwrap();
+        assert!(lock.packages.is_empty());
+    }
+
+    #[test]
+    fn writes_and_loads_minimal_lock_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rsbin.lock.yml");
+        let mut lock = LockFile::default();
+        lock.packages
+            .insert("codex".to_string(), "rust-v0.125.0".to_string());
+        lock.packages.insert("uv".to_string(), "0.11.7".to_string());
+
+        save_lock_file(&path, &lock).unwrap();
+        let loaded = load_lock_file(&path).unwrap();
+
+        assert_eq!(loaded, lock);
+        let yaml = fs::read_to_string(path).unwrap();
+        assert!(yaml.contains("packages:"));
+        assert!(yaml.contains("codex: rust-v0.125.0"));
+    }
+
+    #[test]
+    fn lock_match_skips_unless_forced() {
+        let mut lock = LockFile::default();
+        lock.packages.insert("uv".to_string(), "0.11.7".to_string());
+
+        assert!(is_locked_latest(&lock, "uv", "0.11.7", false));
+        assert!(!is_locked_latest(&lock, "uv", "0.11.7", true));
+        assert!(!is_locked_latest(&lock, "uv", "0.11.8", false));
+        assert!(!is_locked_latest(&lock, "codex", "0.11.7", false));
     }
 
     #[test]
