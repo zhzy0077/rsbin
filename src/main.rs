@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use glob::Pattern;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Deserializer, Serialize};
 use tempfile::NamedTempFile;
@@ -382,7 +383,7 @@ fn match_asset(
         if let Some(asset) = release
             .assets
             .iter()
-            .find(|asset| asset.name == rendered.artifact)
+            .find(|asset| Pattern::new(&rendered.artifact).map(|p| p.matches(&asset.name)).unwrap_or(false))
         {
             return Ok(MatchedAsset {
                 rendered,
@@ -596,11 +597,6 @@ fn extract_tar<R: io::Read>(
     reader: R,
     temp_dir: &Path,
 ) -> Result<Vec<ExtractedFile>> {
-    let wanted: BTreeMap<PathBuf, String> = rendered
-        .files
-        .iter()
-        .map(|file| (file.path.clone(), file.name.clone()))
-        .collect();
     let mut extracted = Vec::new();
     let mut archive = tar::Archive::new(reader);
 
@@ -611,11 +607,24 @@ fn extract_tar<R: io::Read>(
         }
 
         let path = entry.path().context("read tar entry path")?.into_owned();
-        let Some(name) = wanted.get(&path) else {
+        let path_str = path.to_string_lossy();
+        
+        let mut matched_name = None;
+        for file in &rendered.files {
+            if Pattern::new(&file.path.to_string_lossy())
+                .map(|p| p.matches(&path_str))
+                .unwrap_or(false)
+            {
+                matched_name = Some(file.name.clone());
+                break;
+            }
+        }
+
+        let Some(name) = matched_name else {
             continue;
         };
 
-        let target = temp_dir.join(name);
+        let target = temp_dir.join(&name);
         entry
             .unpack(&target)
             .with_context(|| format!("extract {}", path.display()))?;
@@ -686,11 +695,6 @@ fn extract_zip(
     bytes: &[u8],
     temp_dir: &Path,
 ) -> Result<Vec<ExtractedFile>> {
-    let wanted: BTreeMap<PathBuf, String> = rendered
-        .files
-        .iter()
-        .map(|file| (file.path.clone(), file.name.clone()))
-        .collect();
     let mut extracted = Vec::new();
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).context("read zip archive")?;
 
@@ -700,13 +704,25 @@ fn extract_zip(
             continue;
         }
 
-        let path_str = entry.name().to_string();
-        let path = PathBuf::from(&path_str);
-        let Some(name) = wanted.get(&path) else {
+        let path_str = entry.name();
+        let path = PathBuf::from(path_str);
+        
+        let mut matched_name = None;
+        for file in &rendered.files {
+            if Pattern::new(&file.path.to_string_lossy())
+                .map(|p| p.matches(path_str))
+                .unwrap_or(false)
+            {
+                matched_name = Some(file.name.clone());
+                break;
+            }
+        }
+
+        let Some(name) = matched_name else {
             continue;
         };
 
-        let target = temp_dir.join(name);
+        let target = temp_dir.join(&name);
         let mut output =
             File::create(&target).with_context(|| format!("create {}", target.display()))?;
         io::copy(&mut entry, &mut output).with_context(|| format!("extract {}", path.display()))?;
@@ -1181,7 +1197,7 @@ packages:
         {
             let mut zip = zip::ZipWriter::new(Cursor::new(&mut zip_bytes));
             let options = zip::write::SimpleFileOptions::default();
-            zip.start_file("restic.exe", options).unwrap();
+            zip.start_file("restic_1.2.3.exe", options).unwrap();
             zip.write_all(b"restic-bin").unwrap();
             zip.finish().unwrap();
         }
@@ -1192,7 +1208,7 @@ packages:
             files: vec![
                 RenderedFile {
                     name: "restic".to_string(),
-                    path: PathBuf::from("restic.exe"),
+                    path: PathBuf::from("restic*.exe"),
                 },
             ],
         };
