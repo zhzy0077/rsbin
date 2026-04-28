@@ -580,8 +580,12 @@ fn extract_artifact(
     } else if rendered.artifact.ends_with(".tar.xz") || rendered.artifact.ends_with(".txz") {
         let decoder = xz2::read::XzDecoder::new(Cursor::new(bytes));
         extract_tar(rendered, decoder, temp_dir)
+    } else if rendered.artifact.ends_with(".bz2") {
+        extract_single_bz2(rendered, bytes, temp_dir)
     } else if rendered.artifact.ends_with(".zst") {
         extract_single_zst(rendered, bytes, temp_dir)
+    } else if rendered.artifact.ends_with(".zip") {
+        extract_zip(rendered, bytes, temp_dir)
     } else {
         bail!("unsupported artifact format: {}", rendered.artifact)
     }
@@ -649,6 +653,71 @@ fn extract_single_zst(
         name: file.name.clone(),
         source: target,
     }])
+}
+
+fn extract_single_bz2(
+    rendered: &RenderedPackage,
+    bytes: &[u8],
+    temp_dir: &Path,
+) -> Result<Vec<ExtractedFile>> {
+    if rendered.files.len() != 1 {
+        bail!(
+            "{} is a single-file .bz2 artifact but declares {} files",
+            rendered.artifact,
+            rendered.files.len()
+        );
+    }
+
+    let file = &rendered.files[0];
+    let target = temp_dir.join(&file.name);
+    let mut reader = bzip2::read::BzDecoder::new(Cursor::new(bytes));
+    let mut output =
+        File::create(&target).with_context(|| format!("create {}", target.display()))?;
+    io::copy(&mut reader, &mut output).context("decompress bz2 artifact")?;
+
+    Ok(vec![ExtractedFile {
+        name: file.name.clone(),
+        source: target,
+    }])
+}
+
+fn extract_zip(
+    rendered: &RenderedPackage,
+    bytes: &[u8],
+    temp_dir: &Path,
+) -> Result<Vec<ExtractedFile>> {
+    let wanted: BTreeMap<PathBuf, String> = rendered
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.name.clone()))
+        .collect();
+    let mut extracted = Vec::new();
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).context("read zip archive")?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).context("read zip entry")?;
+        if entry.is_dir() {
+            continue;
+        }
+
+        let path_str = entry.name().to_string();
+        let path = PathBuf::from(&path_str);
+        let Some(name) = wanted.get(&path) else {
+            continue;
+        };
+
+        let target = temp_dir.join(name);
+        let mut output =
+            File::create(&target).with_context(|| format!("create {}", target.display()))?;
+        io::copy(&mut entry, &mut output).with_context(|| format!("extract {}", path.display()))?;
+        extracted.push(ExtractedFile {
+            name: name.clone(),
+            source: target,
+        });
+    }
+
+    ensure_all_files_extracted(rendered, &extracted)?;
+    Ok(extracted)
 }
 
 fn ensure_all_files_extracted(
@@ -1080,6 +1149,57 @@ packages:
         let extracted = extract_artifact(&rendered, &compressed, temp.path()).unwrap();
         assert_eq!(extracted.len(), 1);
         assert_eq!(fs::read(temp.path().join("tool")).unwrap(), b"tool-bin");
+    }
+
+    #[test]
+    fn extracts_single_bz2_file() {
+        use std::io::Write;
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = bzip2::write::BzEncoder::new(&mut compressed, bzip2::Compression::default());
+            encoder.write_all(b"tool-bin").unwrap();
+            encoder.finish().unwrap();
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let rendered = RenderedPackage {
+            artifact: "tool.bz2".to_string(),
+            files: vec![RenderedFile {
+                name: "tool".to_string(),
+                path: PathBuf::from("tool"),
+            }],
+        };
+
+        let extracted = extract_artifact(&rendered, &compressed, temp.path()).unwrap();
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(fs::read(temp.path().join("tool")).unwrap(), b"tool-bin");
+    }
+
+    #[test]
+    fn extracts_zip_files() {
+        use std::io::Write;
+        let mut zip_bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut zip_bytes));
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("restic.exe", options).unwrap();
+            zip.write_all(b"restic-bin").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let rendered = RenderedPackage {
+            artifact: "restic.zip".to_string(),
+            files: vec![
+                RenderedFile {
+                    name: "restic".to_string(),
+                    path: PathBuf::from("restic.exe"),
+                },
+            ],
+        };
+
+        let extracted = extract_artifact(&rendered, &zip_bytes, temp.path()).unwrap();
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(fs::read(temp.path().join("restic")).unwrap(), b"restic-bin");
     }
 
     fn append_file<W: Write>(tar: &mut Builder<W>, path: &str, bytes: &[u8]) {
