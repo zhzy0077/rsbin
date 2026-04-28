@@ -325,12 +325,25 @@ fn github_client() -> Result<reqwest::Client> {
         HeaderValue::from_static("application/vnd.github+json"),
     );
 
-    if let Ok(token) = std::env::var("GITHUB_TOKEN")
-        && !token.trim().is_empty()
-    {
-        let value = HeaderValue::from_str(&format!("Bearer {}", token.trim()))
-            .context("build GitHub authorization header")?;
-        headers.insert(AUTHORIZATION, value);
+    let token = std::env::var("GITHUB_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| {
+            std::process::Command::new("gh")
+                .args(["auth", "token"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+        });
+
+    if let Some(token) = token {
+        let token = token.trim();
+        if !token.is_empty() {
+            let value = HeaderValue::from_str(&format!("Bearer {}", token))
+                .context("build GitHub authorization header")?;
+            headers.insert(AUTHORIZATION, value);
+        }
     }
 
     reqwest::Client::builder()
