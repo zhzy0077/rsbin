@@ -154,7 +154,6 @@ async fn update(
     let install_dir = default_install_dir()?;
     let lock_path = default_lock_path()?;
     let mut lock = load_lock_file(&lock_path)?;
-    let mut lock_changed = false;
 
     for package in packages {
         let release = fetch_latest_release(&client, &package.repo)
@@ -198,17 +197,7 @@ async fn update(
         install_package(&client, package, &matched, &install_dir)
             .await
             .with_context(|| format!("install {}", package.name))?;
-        if lock
-            .packages
-            .insert(package.name.clone(), matched.tag_name.clone())
-            != Some(matched.tag_name)
-        {
-            lock_changed = true;
-        }
-    }
-
-    if lock_changed {
-        save_lock_file(&lock_path, &lock)?;
+        record_successful_install(&lock_path, &mut lock, &package.name, &matched.tag_name)?;
     }
 
     Ok(())
@@ -279,6 +268,25 @@ fn is_locked_latest(lock: &LockFile, package_name: &str, latest_tag: &str, force
             .packages
             .get(package_name)
             .is_some_and(|version| version == latest_tag)
+}
+
+fn record_successful_install(
+    lock_path: &Path,
+    lock: &mut LockFile,
+    package_name: &str,
+    tag_name: &str,
+) -> Result<()> {
+    if lock
+        .packages
+        .insert(package_name.to_string(), tag_name.to_string())
+        != Some(tag_name.to_string())
+    {
+        // Persist progress package-by-package so a later failure does not cause
+        // already-installed packages to be downloaded again on the next run.
+        save_lock_file(lock_path, lock)?;
+    }
+
+    Ok(())
 }
 
 fn requested_packages(package_names: &[String]) -> Option<BTreeSet<&str>> {
@@ -393,11 +401,11 @@ fn match_asset(
     release: &GitHubRelease,
 ) -> Result<MatchedAsset> {
     for rendered in render_package_candidates(package, config)? {
-        if let Some(asset) = release
-            .assets
-            .iter()
-            .find(|asset| Pattern::new(&rendered.artifact).map(|p| p.matches(&asset.name)).unwrap_or(false))
-        {
+        if let Some(asset) = release.assets.iter().find(|asset| {
+            Pattern::new(&rendered.artifact)
+                .map(|p| p.matches(&asset.name))
+                .unwrap_or(false)
+        }) {
             return Ok(MatchedAsset {
                 rendered,
                 download_url: asset.browser_download_url.clone(),
@@ -621,7 +629,7 @@ fn extract_tar<R: io::Read>(
 
         let path = entry.path().context("read tar entry path")?.into_owned();
         let path_str = path.to_string_lossy();
-        
+
         let mut matched_name = None;
         for file in &rendered.files {
             if Pattern::new(&file.path.to_string_lossy())
@@ -719,7 +727,7 @@ fn extract_zip(
 
         let path_str = entry.name();
         let path = PathBuf::from(path_str);
-        
+
         let mut matched_name = None;
         for file in &rendered.files {
             if Pattern::new(&file.path.to_string_lossy())
@@ -972,6 +980,54 @@ packages:
     }
 
     #[test]
+    fn matches_restic_wildcard_linux_amd64_asset() {
+        let mut values = HashMap::new();
+        values.insert(
+            "ext".to_string(),
+            DefinitionValueList(vec![
+                "zst".to_string(),
+                "tar.gz".to_string(),
+                "tar.xz".to_string(),
+                "bz2".to_string(),
+                "zip".to_string(),
+            ]),
+        );
+        let mut by_os = HashMap::new();
+        by_os.insert(
+            current_os_key().unwrap().to_string(),
+            vec![DefinitionSet { values }],
+        );
+        let config = Config {
+            definitions: Definitions { by_os },
+            packages: Vec::new(),
+        };
+        let package = Package {
+            name: "restic".to_string(),
+            repo: "https://github.com/restic/restic".to_string(),
+            artifact: "restic_*_{os}_{arch}.{ext}".to_string(),
+            file: vec![FileEntry {
+                name: "restic".to_string(),
+                path: "restic_*_{os}_{arch}".to_string(),
+            }],
+        };
+        let release = GitHubRelease {
+            tag_name: "v0.18.1".to_string(),
+            assets: vec![GitHubAsset {
+                name: "restic_0.18.1_linux_amd64.bz2".to_string(),
+                browser_download_url: "https://example.com/restic.bz2".to_string(),
+            }],
+        };
+
+        let matched = match_asset(&package, &config, &release).unwrap();
+
+        assert_eq!(matched.rendered.artifact, "restic_*_linux_amd64.bz2");
+        assert_eq!(
+            matched.rendered.files[0].path,
+            PathBuf::from("restic_*_linux_amd64")
+        );
+    }
+
+    #[test]
     fn expands_templates() {
         let mut vars = BTreeMap::new();
         vars.insert("arch".to_string(), "x86_64".to_string());
@@ -1036,6 +1092,25 @@ packages:
         assert!(!is_locked_latest(&lock, "uv", "0.11.7", true));
         assert!(!is_locked_latest(&lock, "uv", "0.11.8", false));
         assert!(!is_locked_latest(&lock, "codex", "0.11.7", false));
+    }
+
+    #[test]
+    fn successful_install_is_persisted_before_later_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rsbin.lock.yml");
+        let mut lock = LockFile::default();
+
+        record_successful_install(&path, &mut lock, "rsbin", "v0.1.6").unwrap();
+        let loaded_after_success = load_lock_file(&path).unwrap();
+
+        assert_eq!(
+            loaded_after_success
+                .packages
+                .get("rsbin")
+                .map(String::as_str),
+            Some("v0.1.6")
+        );
+        assert!(!loaded_after_success.packages.contains_key("restic"));
     }
 
     #[test]
@@ -1185,7 +1260,8 @@ packages:
         use std::io::Write;
         let mut compressed = Vec::new();
         {
-            let mut encoder = bzip2::write::BzEncoder::new(&mut compressed, bzip2::Compression::default());
+            let mut encoder =
+                bzip2::write::BzEncoder::new(&mut compressed, bzip2::Compression::default());
             encoder.write_all(b"tool-bin").unwrap();
             encoder.finish().unwrap();
         }
@@ -1218,12 +1294,10 @@ packages:
         let temp = tempfile::tempdir().unwrap();
         let rendered = RenderedPackage {
             artifact: "restic.zip".to_string(),
-            files: vec![
-                RenderedFile {
-                    name: "restic".to_string(),
-                    path: PathBuf::from("restic*.exe"),
-                },
-            ],
+            files: vec![RenderedFile {
+                name: "restic".to_string(),
+                path: PathBuf::from("restic*.exe"),
+            }],
         };
 
         let extracted = extract_artifact(&rendered, &zip_bytes, temp.path()).unwrap();
