@@ -23,6 +23,7 @@ fn read_tar_entries<R: std::io::Read>(reader: R) -> Result<Vec<ArchiveEntry>> {
             continue;
         }
 
+        let mode = entry.header().mode().ok();
         let path = entry.path().context("read tar entry path")?.into_owned();
         let archive_path = path.to_string_lossy().to_string();
         let mut contents = Vec::new();
@@ -32,6 +33,7 @@ fn read_tar_entries<R: std::io::Read>(reader: R) -> Result<Vec<ArchiveEntry>> {
         entries.push(ArchiveEntry {
             archive_path,
             contents,
+            mode,
         });
     }
 

@@ -54,6 +54,27 @@ when a package only publishes MUSL.
 `file[].path` is the path inside the release artifact. `file[].name` is the
 installed filename under the install directory.
 
+By default, configured files are copied directly into `~/.local/bin`. For
+tools that need adjacent runtime files, set `install: package`:
+
+```yaml
+packages:
+  - name: pi
+    repo: https://github.com/badlogic/pi-mono
+    artifact: pi-{os}-{arch}.{ext}
+    install: package
+    file:
+      - name: pi
+        path: pi/pi
+```
+
+Package installs extract the whole artifact into
+`~/.local/bin/packages/<name>` and symlink each configured `file[]` entry into
+`~/.local/bin`. The example above matches pi-mono release assets such as
+`pi-linux-x64.tar.gz`, installs the package tree under
+`~/.local/bin/packages/pi`, and creates `~/.local/bin/pi` as a symlink to the
+packaged `pi/pi` binary.
+
 Supported template variables include:
 
 - `{os}`

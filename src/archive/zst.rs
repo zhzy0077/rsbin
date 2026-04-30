@@ -17,6 +17,7 @@ impl Extractor for ZstExtractor {
         Ok(vec![ArchiveEntry {
             archive_path: archive_path.to_string(),
             contents,
+            mode: None,
         }])
     }
 }

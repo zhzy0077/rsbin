@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use config::{Config, Package, RenderedPackage};
+use config::{Config, InstallMode, Package, RenderedPackage};
 use source::github::GitHubDownloadSource;
 use source::{DownloadSource, ResolvedArtifact};
 
@@ -98,13 +98,7 @@ async fn update(
                 package.name, matched.tag_name, matched.rendered.artifact
             );
         }
-        for file in &matched.rendered.files {
-            println!(
-                "  {} -> {}",
-                file.path.display(),
-                install_dir.join(&file.name).display()
-            );
-        }
+        print_install_plan(package, &matched, &install_dir);
 
         if dry {
             validate_package_archive(&source, &matched)
@@ -221,14 +215,21 @@ async fn install_package(
         .entries(&matched.rendered.artifact, &bytes)
         .with_context(|| format!("extract {}", matched.rendered.artifact))?;
 
-    let selected = select::select_extracted_files(&matched.rendered.files, &entries)?;
-
     std::fs::create_dir_all(install_dir)
         .with_context(|| format!("create install dir {}", install_dir.display()))?;
 
-    for file in selected {
-        install::install_bytes(&file.contents, &install_dir.join(&file.name))
-            .with_context(|| format!("install file {} for {}", file.name, package.name))?;
+    match matched.rendered.install {
+        InstallMode::Bin => {
+            let selected = select::select_extracted_files(&matched.rendered.files, &entries)?;
+            for file in selected {
+                install::install_bytes(&file.contents, &install_dir.join(&file.name))
+                    .with_context(|| format!("install file {} for {}", file.name, package.name))?;
+            }
+        }
+        InstallMode::Package => {
+            let selected = select::select_package_install(&matched.rendered.files, &entries)?;
+            install::install_package_tree(&package.name, &selected, install_dir)?;
+        }
     }
 
     Ok(())
@@ -250,9 +251,41 @@ async fn validate_package_archive(
         .entries(&matched.rendered.artifact, &bytes)
         .with_context(|| format!("validate {}", matched.rendered.artifact))?;
 
-    select::select_extracted_files(&matched.rendered.files, &entries)?;
+    match matched.rendered.install {
+        InstallMode::Bin => {
+            select::select_extracted_files(&matched.rendered.files, &entries)?;
+        }
+        InstallMode::Package => {
+            select::select_package_install(&matched.rendered.files, &entries)?;
+        }
+    }
 
     Ok(())
+}
+
+fn print_install_plan(package: &Package, matched: &MatchedAsset, install_dir: &std::path::Path) {
+    match matched.rendered.install {
+        InstallMode::Bin => {
+            for file in &matched.rendered.files {
+                println!(
+                    "  {} -> {}",
+                    file.path.display(),
+                    install_dir.join(&file.name).display()
+                );
+            }
+        }
+        InstallMode::Package => {
+            let package_dir = install::package_install_dir(install_dir, &package.name);
+            println!("  package -> {}", package_dir.display());
+            for file in &matched.rendered.files {
+                println!(
+                    "  {} -> {}",
+                    install_dir.join(&file.name).display(),
+                    package_dir.join(&file.path).display()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -282,6 +315,26 @@ packages:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.packages.len(), 1);
         assert_eq!(config.packages[0].name, "example");
+        assert_eq!(config.packages[0].install, InstallMode::Bin);
+    }
+
+    #[test]
+    fn parses_package_install_mode() {
+        let yaml = r#"
+def:
+  linux:
+    - arch: amd64
+packages:
+  - name: rtk
+    repo: https://github.com/rtk-ai/rtk
+    artifact: "rtk-{arch}.tar.gz"
+    install: package
+    file:
+      - name: rtk
+        path: rtk
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.packages[0].install, InstallMode::Package);
     }
 
     #[test]
@@ -321,6 +374,7 @@ packages:
   - name: example
     repo: https://github.com/example/example
     artifact: "example-{arch}.tar.gz"
+    install: package
     file:
       - name: example
         path: "example-{arch}"
@@ -330,6 +384,7 @@ packages:
         let candidates = config::render_package_candidates(package, &config).unwrap();
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].artifact, "example-amd64.tar.gz");
+        assert_eq!(candidates[0].install, InstallMode::Package);
         assert_eq!(candidates[1].artifact, "example-arm64.tar.gz");
     }
 
@@ -460,6 +515,7 @@ packages:
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].archive_path, "example-amd64");
         assert_eq!(entries[0].contents, b"binary content");
+        assert_eq!(entries[0].mode, Some(0o755));
     }
 
     #[test]
@@ -479,6 +535,7 @@ packages:
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].archive_path, "example-amd64");
         assert_eq!(entries[0].contents, b"binary content");
+        assert_eq!(entries[0].mode, Some(0o755));
     }
 
     #[test]
@@ -544,6 +601,7 @@ packages:
         let entries = vec![ArchiveEntry {
             archive_path: "example-amd64".to_string(),
             contents: b"binary content".to_vec(),
+            mode: None,
         }];
 
         let selected = select::select_extracted_files(&configured, &entries).unwrap();
@@ -565,6 +623,7 @@ packages:
         let entries = vec![ArchiveEntry {
             archive_path: "example-amd64".to_string(),
             contents: b"binary content".to_vec(),
+            mode: None,
         }];
 
         let selected = select::select_extracted_files(&configured, &entries).unwrap();
@@ -585,6 +644,7 @@ packages:
         let entries = vec![ArchiveEntry {
             archive_path: "example-amd64".to_string(),
             contents: b"binary content".to_vec(),
+            mode: None,
         }];
 
         let result = select::select_extracted_files(&configured, &entries);
@@ -605,15 +665,147 @@ packages:
             ArchiveEntry {
                 archive_path: "example-amd64".to_string(),
                 contents: b"binary content".to_vec(),
+                mode: None,
             },
             ArchiveEntry {
                 archive_path: "README.md".to_string(),
                 contents: b"readme".to_vec(),
+                mode: None,
             },
         ];
 
         let selected = select::select_extracted_files(&configured, &entries).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "example");
+    }
+
+    #[test]
+    fn select_package_install_keeps_tree_and_links_configured_file() {
+        use archive::ArchiveEntry;
+        use config::RenderedFile;
+
+        let configured = vec![RenderedFile {
+            name: "rtk".to_string(),
+            path: std::path::PathBuf::from("rtk"),
+        }];
+
+        let entries = vec![
+            ArchiveEntry {
+                archive_path: "rtk".to_string(),
+                contents: b"binary content".to_vec(),
+                mode: Some(0o755),
+            },
+            ArchiveEntry {
+                archive_path: "theme/dark.json".to_string(),
+                contents: b"{}".to_vec(),
+                mode: Some(0o644),
+            },
+        ];
+
+        let selected = select::select_package_install(&configured, &entries).unwrap();
+
+        assert_eq!(selected.files.len(), 2);
+        assert_eq!(
+            selected.files[0].relative_path,
+            std::path::PathBuf::from("rtk")
+        );
+        assert_eq!(selected.links.len(), 1);
+        assert_eq!(selected.links[0].name, std::path::PathBuf::from("rtk"));
+        assert_eq!(selected.links[0].target, std::path::PathBuf::from("rtk"));
+    }
+
+    #[test]
+    fn select_package_install_fails_on_missing_link_target() {
+        use archive::ArchiveEntry;
+        use config::RenderedFile;
+
+        let configured = vec![RenderedFile {
+            name: "rtk".to_string(),
+            path: std::path::PathBuf::from("missing"),
+        }];
+
+        let entries = vec![ArchiveEntry {
+            archive_path: "rtk".to_string(),
+            contents: b"binary content".to_vec(),
+            mode: Some(0o755),
+        }];
+
+        let result = select::select_package_install(&configured, &entries);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn select_package_install_rejects_unsafe_archive_path() {
+        use archive::ArchiveEntry;
+        use config::RenderedFile;
+
+        let configured = vec![RenderedFile {
+            name: "rtk".to_string(),
+            path: std::path::PathBuf::from("rtk"),
+        }];
+
+        let entries = vec![
+            ArchiveEntry {
+                archive_path: "rtk".to_string(),
+                contents: b"binary content".to_vec(),
+                mode: Some(0o755),
+            },
+            ArchiveEntry {
+                archive_path: "../outside".to_string(),
+                contents: b"bad".to_vec(),
+                mode: Some(0o644),
+            },
+        ];
+
+        let result = select::select_package_install(&configured, &entries);
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_package_tree_writes_files_and_symlinks_bin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let selected = select::SelectedPackage {
+            files: vec![
+                select::SelectedPackageFile {
+                    relative_path: std::path::PathBuf::from("rtk"),
+                    contents: b"binary content".to_vec(),
+                    mode: Some(0o644),
+                },
+                select::SelectedPackageFile {
+                    relative_path: std::path::PathBuf::from("theme/dark.json"),
+                    contents: b"{}".to_vec(),
+                    mode: Some(0o644),
+                },
+            ],
+            links: vec![select::SelectedPackageLink {
+                name: std::path::PathBuf::from("rtk"),
+                target: std::path::PathBuf::from("rtk"),
+            }],
+        };
+
+        install::install_package_tree("rtk", &selected, dir.path()).unwrap();
+
+        let package_file = dir.path().join("packages").join("rtk").join("rtk");
+        let link_path = dir.path().join("rtk");
+
+        assert_eq!(std::fs::read(&package_file).unwrap(), b"binary content");
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_link(&link_path).unwrap(), package_file);
+        assert_ne!(
+            std::fs::metadata(&package_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
     }
 }

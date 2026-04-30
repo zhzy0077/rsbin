@@ -50,7 +50,22 @@ pub struct Package {
     pub name: String,
     pub repo: String,
     pub artifact: String,
+    #[serde(default)]
+    pub install: InstallMode,
     pub file: Vec<FileEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstallMode {
+    Bin,
+    Package,
+}
+
+impl Default for InstallMode {
+    fn default() -> Self {
+        Self::Bin
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +77,7 @@ pub struct FileEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedPackage {
     pub artifact: String,
+    pub install: InstallMode,
     pub files: Vec<RenderedFile>,
 }
 
@@ -123,6 +139,7 @@ pub fn render_package_candidates(
             for vars in expand_definition_set(definition, base_vars)? {
                 let rendered = RenderedPackage {
                     artifact: expand_template(&package.artifact, &vars)?,
+                    install: package.install,
                     files: package
                         .file
                         .iter()

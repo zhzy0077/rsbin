@@ -17,6 +17,7 @@ impl Extractor for ZipExtractor {
                 continue;
             }
 
+            let mode = entry.unix_mode();
             let archive_path = entry.name().to_string();
             let mut contents = Vec::new();
             io::copy(&mut entry, &mut contents)
@@ -25,6 +26,7 @@ impl Extractor for ZipExtractor {
             entries.push(ArchiveEntry {
                 archive_path,
                 contents,
+                mode,
             });
         }
 

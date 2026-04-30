@@ -10,6 +10,7 @@ pub mod zst;
 pub struct ArchiveEntry {
     pub archive_path: String,
     pub contents: Vec<u8>,
+    pub mode: Option<u32>,
 }
 
 pub trait Extractor {
