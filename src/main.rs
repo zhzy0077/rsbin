@@ -173,6 +173,7 @@ fn match_asset(
                 rendered,
                 download_url: asset.download_url.clone(),
                 tag_name: release.tag_name.clone(),
+                asset_name: asset.name.clone(),
             });
         }
     }
@@ -195,6 +196,8 @@ struct MatchedAsset {
     rendered: RenderedPackage,
     download_url: String,
     tag_name: String,
+    /// Actual matched asset name (not the glob pattern)
+    asset_name: String,
 }
 
 async fn install_package(
@@ -210,10 +213,10 @@ async fn install_package(
     };
 
     let bytes = source.download(&artifact).await?;
-    let extractor = archive::select_extractor(&matched.rendered.artifact)?;
+    let extractor = archive::select_extractor(&matched.asset_name)?;
     let entries = extractor
-        .entries(&matched.rendered.artifact, &bytes)
-        .with_context(|| format!("extract {}", matched.rendered.artifact))?;
+        .entries(&matched.asset_name, &bytes)
+        .with_context(|| format!("extract {}", matched.asset_name))?;
 
     std::fs::create_dir_all(install_dir)
         .with_context(|| format!("create install dir {}", install_dir.display()))?;
@@ -246,10 +249,10 @@ async fn validate_package_archive(
     };
 
     let bytes = source.download(&artifact).await?;
-    let extractor = archive::select_extractor(&matched.rendered.artifact)?;
+    let extractor = archive::select_extractor(&matched.asset_name)?;
     let entries = extractor
-        .entries(&matched.rendered.artifact, &bytes)
-        .with_context(|| format!("validate {}", matched.rendered.artifact))?;
+        .entries(&matched.asset_name, &bytes)
+        .with_context(|| format!("validate {}", matched.asset_name))?;
 
     match matched.rendered.install {
         InstallMode::Bin => {
