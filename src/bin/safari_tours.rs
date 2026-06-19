@@ -100,7 +100,8 @@ async fn crawl(client: &reqwest::Client, cli: &Cli) -> Result<Vec<TourMatch>> {
     let mut matches = Vec::new();
 
     while let Some(listing_url) = listing_queue.pop_front() {
-        if seen_listing_pages.len() >= cli.max_pages || !seen_listing_pages.insert(listing_url.clone())
+        if seen_listing_pages.len() >= cli.max_pages
+            || !seen_listing_pages.insert(listing_url.clone())
         {
             continue;
         }
@@ -194,20 +195,20 @@ fn extract_next_listing_links(document: &Html, base_url: &Url) -> Vec<Url> {
 
     for link in document.select(&link_selector) {
         let text = normalized_text(link.text());
-        let rel_next = link
-            .value()
-            .attr("rel")
-            .is_some_and(|rel| rel.split_whitespace().any(|part| part.eq_ignore_ascii_case("next")));
-        if !rel_next && text.to_ascii_lowercase() != "next" && text != "›" && text != ">" {
+        let rel_next = link.value().attr("rel").is_some_and(|rel| {
+            rel.split_whitespace()
+                .any(|part| part.eq_ignore_ascii_case("next"))
+        });
+        if !rel_next && !text.eq_ignore_ascii_case("next") && text != "›" && text != ">" {
             continue;
         }
 
-        if let Some(href) = link.value().attr("href") {
-            if let Ok(mut url) = base_url.join(href) {
-                url.set_fragment(None);
-                if url.domain() == base_url.domain() && url.path().starts_with("/tours") {
-                    links.insert(url);
-                }
+        if let Some(href) = link.value().attr("href")
+            && let Ok(mut url) = base_url.join(href)
+        {
+            url.set_fragment(None);
+            if url.domain() == base_url.domain() && url.path().starts_with("/tours") {
+                links.insert(url);
             }
         }
     }
@@ -359,12 +360,17 @@ fn extract_green_keywords(lower_text: &str) -> Vec<String> {
 
 fn contains_excluded_shared_activity_terms(lower_text: &str) -> bool {
     contains_phrase(lower_text, "shared with others")
-        || (contains_phrase(lower_text, "wildlife viewing activities are run by the lodges")
-            && contains_phrase(lower_text, "shared"))
+        || (contains_phrase(
+            lower_text,
+            "wildlife viewing activities are run by the lodges",
+        ) && contains_phrase(lower_text, "shared"))
 }
 
 fn airport_transfer_included(lower_text: &str) -> bool {
-    contains_phrase(lower_text, "transfer from and back to the airport is included")
+    contains_phrase(
+        lower_text,
+        "transfer from and back to the airport is included",
+    )
 }
 
 fn contains_phrase(lower_text: &str, phrase: &str) -> bool {
@@ -445,7 +451,9 @@ mod tests {
             "Airport transfers can be arranged at extra cost.",
         );
         let decision = analyze_tour(&html);
-        assert!(matches!(decision, TourDecision::Drop(reason) if reason == "airport transfer is not explicitly included"));
+        assert!(
+            matches!(decision, TourDecision::Drop(reason) if reason == "airport transfer is not explicitly included")
+        );
     }
 
     #[test]
@@ -469,6 +477,9 @@ mod tests {
 
         let links = extract_tour_links(&document, &base_url);
         assert_eq!(links.len(), 1);
-        assert_eq!(links[0].as_str(), "https://www.safaribookings.com/tours/t123/example");
+        assert_eq!(
+            links[0].as_str(),
+            "https://www.safaribookings.com/tours/t123/example"
+        );
     }
 }
